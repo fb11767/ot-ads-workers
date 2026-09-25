@@ -1,3 +1,4 @@
 requests==2.34.2
 Pillow==12.3.0
 replicate==1.0.7
+numpy==2.4.4
