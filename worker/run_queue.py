@@ -367,13 +367,49 @@ def build_prompt(brief: dict[str, Any], copy_text: str, classification: str) -> 
     return "\n\n".join(parts)
 
 
+GPT_IMAGE_RATIOS: tuple[tuple[str, float], ...] = (
+    ("1:1", 1.0),
+    ("3:2", 3 / 2),
+    ("2:3", 2 / 3),
+    ("4:3", 4 / 3),
+    ("3:4", 3 / 4),
+    ("16:9", 16 / 9),
+    ("9:16", 9 / 16),
+)
+ENGINES = {
+    "gpt-image": "openai/gpt-image-2.5-sunburst",
+    "nano-banana": "google/nano-banana-pro",
+}
+
+
+def is_gpt_image(model: str) -> bool:
+    return "gpt-image" in model
+
+
+def gpt_aspect_ratio(width: int, height: int) -> str:
+    ratio = width / height
+    name, _value = min(GPT_IMAGE_RATIOS, key=lambda item: abs(math.log(item[1] / ratio)))
+    return name
+
+
 def model_input(
     model: str,
     prompt: str,
     image_path: Path | list[Path],
     resolution: str = "2K",
+    aspect_ratio: str | None = None,
 ) -> dict[str, Any]:
     paths = image_path if isinstance(image_path, list) else [image_path]
+    if is_gpt_image(model):
+        # openai_api_key reste absent : le proxy Replicate suffit avec REPLICATE_API_TOKEN.
+        return {
+            "prompt": prompt,
+            "input_images": paths,
+            "output_format": "jpeg",
+            "quality": "auto",
+            "number_of_images": 1,
+            "aspect_ratio": aspect_ratio or "auto",
+        }
     if "kontext" in model:
         return {
             "prompt": prompt,
@@ -654,8 +690,6 @@ def adapt_image(
 
 # Boîte du tableau blanc sur les visuels 1254×1254 (phrase manuscrite seule).
 WHITEBOARD_BOX = (470, 88, 1100, 292)
-TEXT_MODEL = "google/nano-banana-pro"
-EDIT_MODEL = "google/nano-banana-pro"
 LOCAL_GOLF = {
     "be-nl": "a Belgian golf course in Flanders or the Ardennes",
     "pt": "a Portuguese golf course on the coast near Sintra",
@@ -691,14 +725,6 @@ def task_kind(instruction: str) -> str:
     if "cycliste" in text or "panneau" in text:
         return "sign"
     return "edit"
-
-
-def model_for_kind(kind: str) -> str:
-    # Le tableau blanc exige un modèle fiable sur le texte manuscrit.
-    # Les autres retouches restent une édition guidée par consigne et référence.
-    if kind == "whiteboard":
-        return TEXT_MODEL
-    return EDIT_MODEL
 
 
 def center_crop_resize(image: Image.Image, width: int, height: int) -> Image.Image:
@@ -859,8 +885,37 @@ def edit_with_references(
 
     if not images:
         raise ValueError("aucune image à éditer")
-    padded_primary, meta = pad_to_supported(images[0])
     client = replicate.Client()
+    if is_gpt_image(model):
+        primary = images[0].convert("RGB")
+        with tempfile.TemporaryDirectory(prefix="ot-fix-") as tmp:
+            root = Path(tmp)
+            paths: list[Path] = []
+            for index, image in enumerate(images):
+                path = root / f"in_{index}.jpg"
+                save_jpg(image.convert("RGB"), path, quality=95)
+                paths.append(path)
+            raw_path = root / "raw.jpg"
+            prediction = run_prediction(
+                client,
+                model,
+                model_input(
+                    model,
+                    prompt,
+                    paths,
+                    aspect_ratio=gpt_aspect_ratio(primary.width, primary.height),
+                ),
+                limiter,
+                timeout_s,
+            )
+            prediction_id = str(prediction.id)
+            if prediction.status != "succeeded":
+                detail = prediction.error or prediction.status
+                raise WorkerError(f"{prediction_id}: {detail}", prediction_id)
+            raw_path.write_bytes(download_output(output_url(prediction.output)))
+            fitted = center_crop_resize(open_rgb(raw_path), primary.width, primary.height)
+        return fitted, prediction_id
+    padded_primary, meta = pad_to_supported(images[0])
     with tempfile.TemporaryDirectory(prefix="ot-fix-") as tmp:
         paths: list[Path] = []
         root = Path(tmp)
@@ -1042,6 +1097,7 @@ def process_fix_item(
     force: bool,
     max_attempts: int,
     previous: dict[str, Any] | None,
+    model: str,
 ) -> dict[str, Any]:
     country = ""
     src_ad = ""
@@ -1058,7 +1114,6 @@ def process_fix_item(
         if not instruction:
             raise ValueError("instruction vide")
         kind = task_kind(instruction)
-        model = model_for_kind(kind)
         target = parse_target_size(item.get("target_size"))
         destination = output_path(artifacts, country, src_ad)
         out_label = destination.as_posix()
@@ -1148,7 +1203,6 @@ def process_fix_item(
         message = redact(str(exc) or exc.__class__.__name__)
         label = f"{country} {src_ad}".strip() or "?"
         print(f"[échec] {label} : {message}", file=sys.stderr, flush=True)
-        model = EDIT_MODEL
         attempts = int(previous.get("attempts") or 0) if previous else 0
         return fix_report_entry(country, src_ad, "échec", model, attempts, message)
 
@@ -1196,6 +1250,7 @@ def run_fix_queue(args: argparse.Namespace, queue: list[Any]) -> int:
             args.force,
             args.max_attempts,
             previous.get(key),
+            ENGINES[args.engine],
         )
         ordered.append(entry)
         by_key[key] = entry
@@ -1316,7 +1371,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--inputs", required=True, type=Path, help="Dossier des sources, briefs et copies")
     parser.add_argument("--artifacts", type=Path, default=Path("artifacts"), help="Dossier de sortie")
     parser.add_argument("--max-per-minute", type=int, default=6, help="Prédictions max par minute (défaut 6)")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Modèle Replicate (défaut {DEFAULT_MODEL})")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Modèle Replicate du mode adapt (défaut {DEFAULT_MODEL})")
+    parser.add_argument(
+        "--engine",
+        choices=tuple(ENGINES),
+        default="gpt-image",
+        help="Moteur du mode fix : gpt-image (défaut, openai/gpt-image-2.5-sunburst) ou nano-banana",
+    )
     parser.add_argument("--timeout", type=int, default=900, help="Attente max d'une prédiction, en secondes")
     parser.add_argument("--dry-run", action="store_true", help="Valide la file et les chemins, sans Replicate")
     parser.add_argument("--force", action="store_true", help="Régénère un item même si le JPG existe")
