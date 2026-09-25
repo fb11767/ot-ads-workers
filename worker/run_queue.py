@@ -25,6 +25,11 @@ from typing import Any, Callable
 
 from PIL import Image, ImageOps
 
+try:
+    import qa as qa_mod
+except ImportError:  # import depuis la racine du dépôt
+    from worker import qa as qa_mod
+
 DEFAULT_MODEL = "google/nano-banana-pro"
 SUPPORTED_RATIOS: tuple[tuple[int, int], ...] = (
     (1, 1),
@@ -398,6 +403,7 @@ def model_input(
     image_path: Path | list[Path],
     resolution: str = "2K",
     aspect_ratio: str | None = None,
+    quality: str | None = None,
 ) -> dict[str, Any]:
     paths = image_path if isinstance(image_path, list) else [image_path]
     if is_gpt_image(model):
@@ -406,7 +412,7 @@ def model_input(
             "prompt": prompt,
             "input_images": paths,
             "output_format": "jpeg",
-            "quality": "auto",
+            "quality": quality or "auto",
             "number_of_images": 1,
             "aspect_ratio": aspect_ratio or "auto",
         }
@@ -727,6 +733,16 @@ def task_kind(instruction: str) -> str:
     return "edit"
 
 
+def resize_exact(image: Image.Image, width: int, height: int) -> Image.Image:
+    """Échelle l'image entière à la taille cible, sans rien recadrer ni recomposer."""
+    if width < 1 or height < 1:
+        raise ValueError("target_size invalide")
+    image = image.convert("RGB")
+    if image.size != (width, height):
+        image = image.resize((width, height), Image.Resampling.LANCZOS)
+    return image
+
+
 def center_crop_resize(image: Image.Image, width: int, height: int) -> Image.Image:
     """Recadrage centré au ratio cible, puis resize exact."""
     if width < 1 or height < 1:
@@ -879,8 +895,15 @@ def edit_with_references(
     limiter: RateLimiter,
     timeout_s: int,
     resolution: str = "2K",
+    fit: str = "cover",
+    target: tuple[int, int] | None = None,
+    quality: str | None = None,
 ) -> tuple[Image.Image, str]:
-    """Édite la première image ; les suivantes sont des références. Retour aux pixels de la première."""
+    """Édite la première image ; les suivantes sont des références.
+
+    fit="resize" met à l'échelle la sortie entière (pas de recadrage, pas de collage).
+    C'est le seul ajustement utilisé par la boucle QA gpt-image.
+    """
     import replicate
 
     if not images:
@@ -888,6 +911,7 @@ def edit_with_references(
     client = replicate.Client()
     if is_gpt_image(model):
         primary = images[0].convert("RGB")
+        out_w, out_h = target or primary.size
         with tempfile.TemporaryDirectory(prefix="ot-fix-") as tmp:
             root = Path(tmp)
             paths: list[Path] = []
@@ -903,7 +927,8 @@ def edit_with_references(
                     model,
                     prompt,
                     paths,
-                    aspect_ratio=gpt_aspect_ratio(primary.width, primary.height),
+                    aspect_ratio=gpt_aspect_ratio(out_w, out_h),
+                    quality=quality,
                 ),
                 limiter,
                 timeout_s,
@@ -913,7 +938,11 @@ def edit_with_references(
                 detail = prediction.error or prediction.status
                 raise WorkerError(f"{prediction_id}: {detail}", prediction_id)
             raw_path.write_bytes(download_output(output_url(prediction.output)))
-            fitted = center_crop_resize(open_rgb(raw_path), primary.width, primary.height)
+            raw = open_rgb(raw_path)
+            if fit == "resize":
+                fitted = resize_exact(raw, out_w, out_h)
+            else:
+                fitted = center_crop_resize(raw, primary.width, primary.height)
         return fitted, prediction_id
     padded_primary, meta = pad_to_supported(images[0])
     with tempfile.TemporaryDirectory(prefix="ot-fix-") as tmp:
@@ -942,7 +971,12 @@ def edit_with_references(
             detail = prediction.error or prediction.status
             raise WorkerError(f"{prediction_id}: {detail}", prediction_id)
         raw_path.write_bytes(download_output(output_url(prediction.output)))
-        fitted = fit_cover(open_rgb(raw_path), meta)
+        raw = open_rgb(raw_path)
+        if fit == "resize":
+            out_w, out_h = target or (meta.width, meta.height)
+            fitted = resize_exact(raw, out_w, out_h)
+        else:
+            fitted = fit_cover(raw, meta)
     return fitted, prediction_id
 
 
@@ -974,6 +1008,162 @@ def load_report_index(path: Path) -> dict[tuple[str, str], dict[str, Any]]:
         if isinstance(item, dict) and item.get("country") and item.get("src_ad"):
             index[(str(item["country"]), str(item["src_ad"]))] = item
     return index
+
+
+def image_report_path(artifacts: Path, country: str, src_ad: str) -> Path:
+    return artifacts / country / src_ad / "report.json"
+
+
+def summary_path(artifacts: Path, indices: str) -> Path:
+    text = indices.strip()
+    if not text:
+        return artifacts / "batch_summary.json"
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", text)
+    return artifacts / f"batch_summary_{safe}.json"
+
+
+def qa_brief_for_fix(item: dict[str, Any], inputs: Path) -> dict[str, Any]:
+    payload = dict(item)
+    raw = item.get("brief")
+    if isinstance(raw, str) and raw.strip():
+        path = Path(raw)
+        if not path.is_file():
+            path = resolve_fix_path(raw, inputs)
+        loaded = load_json(path)
+        if not isinstance(loaded, dict):
+            raise ValueError("brief QA invalide")
+        payload["brief"] = loaded
+    return qa_mod.brief_from_fix_item(payload)
+
+
+def _predict(model: str, payload: dict[str, Any], limiter: RateLimiter, timeout_s: int) -> Any:
+    import replicate
+
+    client = replicate.Client()
+    return run_prediction(client, model, payload, limiter, timeout_s)
+
+
+def process_fix_item_qa(
+    item: dict[str, Any],
+    inputs: Path,
+    artifacts: Path,
+    limiter: RateLimiter,
+    timeout_s: int,
+    max_attempts: int,
+    model: str,
+    qa_model: str,
+    checklist: str,
+    image_quality: str | None,
+    current: Image.Image,
+    reference: Image.Image,
+    target: tuple[int, int],
+    kind: str,
+    destination: Path,
+) -> dict[str, Any]:
+    """Génère l'image entière, lance le QA, et réinjecte les corrections. Au plus max_attempts."""
+    country = str(item["country"])
+    src_ad = str(item["src_ad"])
+    brief = qa_brief_for_fix(item, inputs)
+    brief["country"] = country
+    brief["src_ad"] = src_ad
+    if brief.get("target_size") is None:
+        brief["target_size"] = target
+    out_label = destination.as_posix()
+    report_path = image_report_path(artifacts, country, src_ad)
+    corrections: list[dict[str, Any]] = []
+    best: dict[str, Any] | None = None
+    prediction_ids: list[str] = []
+    qa_metrics: list[dict[str, Any]] = []
+    generated = 0
+    started = time.perf_counter()
+    used_attempts = 0
+    for attempt in range(1, max_attempts + 1):
+        used_attempts = attempt
+        prompt = build_fix_prompt(item, kind, attempt)
+        addon = qa_mod.generation_addon(brief, corrections)
+        if addon:
+            prompt = prompt + "\n\n" + addon
+        try:
+            edited, prediction_id = edit_with_references(
+                [current, reference],
+                prompt,
+                model,
+                limiter,
+                timeout_s,
+                fit="resize",
+                target=target,
+                quality=image_quality,
+            )
+        except Exception as exc:
+            message = redact(str(exc) or exc.__class__.__name__)
+            report = qa_mod.model_fail(
+                country,
+                src_ad,
+                f"Generation error: {message}",
+                "Regenerate the whole image. Do not crop, paste or composite.",
+            )
+            rank = qa_mod.attempt_rank(report, 0.0)
+            if best is None or rank < best["rank"]:
+                best = {"rank": rank, "image": None, "report": report, "attempt": used_attempts}
+            corrections = report["fails"]
+            print(f"[retry] {country} {src_ad} essai {attempt} : {message}", flush=True)
+            continue
+        prediction_ids.append(prediction_id)
+        generated += 1
+        if edited.size != target:
+            edited = resize_exact(edited, target[0], target[1])
+        report, metrics = qa_mod.evaluate_image(
+            edited,
+            reference,
+            brief,
+            checklist=checklist,
+            model=qa_model,
+            predict=lambda qa_model_name, payload: _predict(qa_model_name, payload, limiter, timeout_s),
+        )
+        qa_metrics.append(metrics)
+        rank = qa_mod.attempt_rank(report, qa_mod.sharpness_score(edited))
+        if best is None or rank < best["rank"]:
+            best = {"rank": rank, "image": edited, "report": report, "attempt": used_attempts}
+        if report["verdict"] == "PASS":
+            print(f"[ok] {country} {src_ad} QA PASS essai {attempt}", flush=True)
+            break
+        corrections = report["fails"]
+        items = ", ".join(str(fail["item"]) for fail in corrections)
+        print(f"[retry] {country} {src_ad} essai {attempt} QA FAIL items {items}", flush=True)
+    assert best is not None
+    report = redact_report(best["report"])
+    if best["image"] is not None:
+        save_jpg(best["image"], destination, quality=JPG_QUALITY)
+    write_report(report_path, report)
+    elapsed = time.perf_counter() - started
+    verdict = report["verdict"]
+    status = "ok" if verdict == "PASS" else "échec"
+    width = best["image"].size[0] if best["image"] is not None else None
+    height = best["image"].size[1] if best["image"] is not None else None
+    entry = fix_report_entry(
+        country,
+        src_ad,
+        status,
+        model,
+        int(best["attempt"]),
+        f"qa {verdict}, essai {best['attempt']}",
+        out_label if destination.is_file() else None,
+        width,
+        height,
+        prediction_ids,
+    )
+    entry["verdict"] = report["verdict"]
+    entry["fails"] = report["fails"]
+    entry["report"] = report_path.resolve().as_posix()
+    if destination.is_file():
+        entry["out"] = destination.resolve().as_posix()
+    entry["attempts_this_run"] = used_attempts
+    entry["seconds"] = round(elapsed, 3)
+    entry["generated_images"] = generated
+    entry["qa_metrics"] = qa_metrics
+    entry["qa_model"] = qa_model
+    print(f"[{verdict}] {country} {src_ad} -> {out_label}", flush=True)
+    return entry
 
 
 def fix_report_entry(
@@ -1098,6 +1288,10 @@ def process_fix_item(
     max_attempts: int,
     previous: dict[str, Any] | None,
     model: str,
+    qa_enabled: bool = False,
+    qa_model: str = qa_mod.QA_MODEL_DEFAULT,
+    checklist: str = "",
+    image_quality: str | None = None,
 ) -> dict[str, Any]:
     country = ""
     src_ad = ""
@@ -1120,9 +1314,17 @@ def process_fix_item(
         prior_attempts = int(previous.get("attempts") or 0) if previous else 0
         if destination.is_file() and destination.stat().st_size > 0 and not force and not dry_run:
             existing = open_rgb(destination)
-            if existing.size == target and previous and previous.get("status") == "ok":
+            passed_before = previous and previous.get("status") == "ok"
+            if qa_enabled:
+                passed_before = bool(
+                    passed_before
+                    and previous
+                    and previous.get("verdict") == "PASS"
+                    and image_report_path(artifacts, country, src_ad).is_file()
+                )
+            if existing.size == target and passed_before:
                 print(f"[skipped] {country} {src_ad}", flush=True)
-                kept = dict(previous)
+                kept = dict(previous or {})
                 kept["out"] = out_label
                 return kept
         if dry_run:
@@ -1147,6 +1349,26 @@ def process_fix_item(
         assert limiter is not None
         current = open_rgb(resolve_fix_path(str(item["current"]), inputs))
         reference = open_rgb(resolve_fix_path(str(item["ca_source"]), inputs))
+        if qa_enabled:
+            if not checklist:
+                checklist = qa_mod.load_checklist()
+            return process_fix_item_qa(
+                item,
+                inputs,
+                artifacts,
+                limiter,
+                timeout_s,
+                max_attempts,
+                model,
+                qa_model,
+                checklist,
+                image_quality,
+                current,
+                reference,
+                target,
+                kind,
+                destination,
+            )
         start_attempt = prior_attempts + 1 if force else 1
         last_remark = "échec"
         last_final: Image.Image | None = None
@@ -1204,7 +1426,17 @@ def process_fix_item(
         label = f"{country} {src_ad}".strip() or "?"
         print(f"[échec] {label} : {message}", file=sys.stderr, flush=True)
         attempts = int(previous.get("attempts") or 0) if previous else 0
-        return fix_report_entry(country, src_ad, "échec", model, attempts, message)
+        entry = fix_report_entry(country, src_ad, "échec", model, attempts, message)
+        if qa_enabled and country and src_ad:
+            report = redact_report(
+                qa_mod.model_fail(country, src_ad, message, "Fix the error and rerun the whole-image generation.")
+            )
+            report_file = image_report_path(artifacts, country, src_ad)
+            write_report(report_file, report)
+            entry["verdict"] = "FAIL"
+            entry["fails"] = report["fails"]
+            entry["report"] = report_file.resolve().as_posix()
+        return entry
 
 
 def parse_only(raw: str) -> set[tuple[str, str]] | None:
@@ -1220,24 +1452,118 @@ def parse_only(raw: str) -> set[tuple[str, str]] | None:
     return selected
 
 
+def redact_report(report: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "country": report.get("country") or "",
+        "src_ad": report.get("src_ad") or "",
+        "verdict": report.get("verdict") or "FAIL",
+        "fails": [
+            {
+                "item": fail.get("item"),
+                "detail": redact(str(fail.get("detail") or "")),
+                "correction": redact(str(fail.get("correction") or "")),
+            }
+            for fail in report.get("fails") or []
+        ],
+    }
+
+
+def _safe_name(value: str, pattern: re.Pattern[str], fallback: str) -> str:
+    text = value.strip()
+    if pattern.fullmatch(text) and ".." not in text:
+        return text
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("._") or fallback
+    return cleaned[:64]
+
+
+def write_batch_summary(
+    artifacts: Path,
+    indices: str,
+    mode: str,
+    ordered: list[dict[str, Any]],
+    qa_model: str,
+    image_quality: str,
+) -> Path:
+    qa_metrics: list[dict[str, Any]] = []
+    generated = 0
+    items: list[dict[str, Any]] = []
+    for entry in ordered:
+        qa_metrics.extend(entry.get("qa_metrics") or [])
+        generated += int(entry.get("generated_images") or 0)
+        items.append(
+            {
+                "country": entry.get("country"),
+                "src_ad": entry.get("src_ad"),
+                "verdict": entry.get("verdict"),
+                "status": entry.get("status"),
+                "attempts": entry.get("attempts"),
+                "seconds": entry.get("seconds"),
+                "image": entry.get("out"),
+                "report": entry.get("report"),
+            }
+        )
+    passed = sum(1 for entry in ordered if entry.get("verdict") == "PASS")
+    failed = sum(1 for entry in ordered if entry.get("verdict") == "FAIL")
+    payload = {
+        "mode": mode,
+        "indices": indices or None,
+        "pass": passed,
+        "fail": failed,
+        "total": len(ordered),
+        "items": items,
+        "cost": qa_mod.estimate_cost(
+            qa_metrics,
+            qa_model=qa_model,
+            generated_images=generated,
+            image_quality=image_quality or "auto",
+        ),
+    }
+    path = summary_path(artifacts, indices)
+    write_report(path, payload)
+    print(f"batch: {passed} PASS, {failed} FAIL, {len(ordered)} total", flush=True)
+    print(f"résumé: {path.resolve().as_posix()}", flush=True)
+    for item in items:
+        if item.get("image"):
+            print(f"image: {item['image']}", flush=True)
+        if item.get("report"):
+            print(f"rapport: {item['report']}", flush=True)
+    return path
+
+
 def run_fix_queue(args: argparse.Namespace, queue: list[Any]) -> int:
     if not args.dry_run and not token_present():
         print(missing_token_message(), file=sys.stderr)
         return 1
+    try:
+        indexes = qa_mod.select_indices(len(queue), args.indices)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     selected = parse_only(args.only)
-    report_path = args.artifacts / "report.json"
+    qa_enabled = not args.no_qa
+    if args.indices.strip():
+        report_path = args.artifacts / f"report_{summary_path(args.artifacts, args.indices).stem.removeprefix('batch_summary_')}.json"
+    else:
+        report_path = args.artifacts / "report.json"
     previous = load_report_index(report_path)
     limiter = None if args.dry_run else RateLimiter(args.max_per_minute)
+    checklist = ""
+    if qa_enabled and not args.dry_run:
+        try:
+            checklist = qa_mod.load_checklist(args.checklist)
+        except (OSError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
     ordered: list[dict[str, Any]] = []
-    by_key: dict[tuple[str, str], dict[str, Any]] = {}
-    for item in queue:
+    for index in indexes:
+        item = queue[index]
         if not isinstance(item, dict):
-            entry = fix_report_entry("", "", "échec", args.model, 0, "item de file invalide")
+            entry = fix_report_entry("", "", "échec", ENGINES[args.engine], 0, "item de file invalide")
             ordered.append(entry)
             continue
         key = (str(item.get("country", "")).strip(), str(item.get("src_ad", "")).strip())
         if selected is not None and key not in selected:
-            if key in previous:
+            if not args.indices.strip() and key in previous:
                 ordered.append(previous[key])
             continue
         entry = process_fix_item(
@@ -1251,28 +1577,140 @@ def run_fix_queue(args: argparse.Namespace, queue: list[Any]) -> int:
             args.max_attempts,
             previous.get(key),
             ENGINES[args.engine],
+            qa_enabled=qa_enabled,
+            qa_model=args.qa_model,
+            checklist=checklist,
+            image_quality=args.image_quality,
         )
+        if entry.get("verdict"):
+            strict = redact_report(
+                {
+                    "country": entry.get("country"),
+                    "src_ad": entry.get("src_ad"),
+                    "verdict": entry.get("verdict"),
+                    "fails": entry.get("fails") or [],
+                }
+            )
+            report_file = image_report_path(args.artifacts, str(entry.get("country") or ""), str(entry.get("src_ad") or ""))
+            write_report(report_file, strict)
+            entry["report"] = report_file.resolve().as_posix()
+            entry["fails"] = strict["fails"]
+            entry["verdict"] = strict["verdict"]
         ordered.append(entry)
-        by_key[key] = entry
         payload = {
             "max_per_minute": args.max_per_minute,
             "dry_run": bool(args.dry_run),
+            "indices": args.indices or None,
+            "qa": qa_enabled,
             "items": ordered,
         }
         write_report(report_path, payload)
-    payload = {
-        "max_per_minute": args.max_per_minute,
-        "dry_run": bool(args.dry_run),
-        "items": ordered,
-    }
-    write_report(report_path, payload)
+    if qa_enabled and not args.dry_run:
+        write_batch_summary(
+            args.artifacts,
+            args.indices,
+            "fix",
+            ordered,
+            args.qa_model,
+            args.image_quality or "auto",
+        )
     counts: dict[str, int] = {}
     for item in ordered:
         counts[item["status"]] = counts.get(item["status"], 0) + 1
     summary = ", ".join(f"{count} {status}" for status, count in sorted(counts.items()))
     print(f"{len(ordered)} item(s): {summary}", flush=True)
-    print(f"rapport: {report_path.as_posix()}", flush=True)
+    print(f"rapport: {report_path.resolve().as_posix()}", flush=True)
     if any(item["status"] == "échec" for item in ordered):
+        return 1
+    if qa_enabled and any(item.get("verdict") == "FAIL" for item in ordered):
+        return 1
+    return 0
+
+
+def run_qa_mode(args: argparse.Namespace) -> int:
+    if not args.dry_run and not token_present():
+        print(missing_token_message(), file=sys.stderr)
+        return 1
+    checklist = qa_mod.load_checklist(args.checklist)
+    try:
+        if args.qa_folder is not None:
+            jobs = qa_mod.discover_folder(args.qa_folder)
+        elif args.queue is not None:
+            jobs = qa_mod.load_job_list(args.queue, args.inputs)
+        else:
+            print("mode qa : fournir --qa-folder ou --queue", file=sys.stderr)
+            return 1
+        indexes = qa_mod.select_indices(len(jobs), args.indices)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    jobs = [jobs[index] for index in indexes]
+    limiter = None if args.dry_run else RateLimiter(args.max_per_minute)
+    ordered: list[dict[str, Any]] = []
+    file_error = False
+    for job in jobs:
+        started = time.perf_counter()
+        country = _safe_name(str(job.get("country") or ""), COUNTRY_RE, "qa")
+        src_ad = _safe_name(str(job.get("src_ad") or ""), SRC_AD_RE, "item")
+        brief = dict(job["brief"])
+        brief["country"] = country
+        brief["src_ad"] = src_ad
+        report_file = image_report_path(args.artifacts, country, src_ad)
+        metrics: dict[str, Any] = {}
+        try:
+            if args.dry_run:
+                image = qa_mod.open_rgb(job["adapted"])
+                source = qa_mod.open_rgb(job["ca_source"])
+                det = qa_mod.deterministic_fails(image, brief, source)
+                report = qa_mod.model_fail(
+                    country,
+                    src_ad,
+                    "Dry run: the vision model was not called, so this item cannot PASS.",
+                    "Rerun without --dry-run to certify the image.",
+                    det,
+                )
+            else:
+                assert limiter is not None
+                report, metrics = qa_mod.evaluate_image(
+                    job["adapted"],
+                    job["ca_source"],
+                    brief,
+                    checklist=checklist,
+                    model=args.qa_model,
+                    predict=lambda model, payload: _predict(model, payload, limiter, args.timeout),
+                )
+        except Exception as exc:
+            file_error = True
+            report = qa_mod.model_fail(
+                country,
+                src_ad,
+                f"QA error: {exc}",
+                "Fix the input files and rerun QA.",
+            )
+        report = redact_report(report)
+        write_report(report_file, report)
+        elapsed = round(time.perf_counter() - started, 3)
+        print(f"[{report['verdict']}] {country} {src_ad} ({elapsed}s)", flush=True)
+        ordered.append(
+            {
+                "country": country,
+                "src_ad": src_ad,
+                "verdict": report["verdict"],
+                "status": "ok" if report["verdict"] == "PASS" else "échec",
+                "attempts": 0,
+                "seconds": elapsed,
+                "out": job["adapted"].resolve().as_posix(),
+                "report": report_file.resolve().as_posix(),
+                "qa_metrics": [metrics] if metrics else [],
+                "generated_images": 0,
+            }
+        )
+    write_batch_summary(args.artifacts, args.indices, "qa", ordered, args.qa_model, args.image_quality or "auto")
+    if file_error and not args.dry_run:
+        return 1
+    if args.dry_run:
+        return 1 if file_error else 0
+    if any(entry["verdict"] == "FAIL" for entry in ordered):
         return 1
     return 0
 
@@ -1367,8 +1805,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Adapte une file d'images publicitaires Ortho Terre via Replicate."
     )
-    parser.add_argument("--queue", required=True, type=Path, help="File JSON (liste d'items)")
-    parser.add_argument("--inputs", required=True, type=Path, help="Dossier des sources, briefs et copies")
+    parser.add_argument("--queue", type=Path, default=None, help="File JSON (liste d'items)")
+    parser.add_argument("--inputs", type=Path, default=None, help="Dossier des sources, briefs et copies")
     parser.add_argument("--artifacts", type=Path, default=Path("artifacts"), help="Dossier de sortie")
     parser.add_argument("--max-per-minute", type=int, default=6, help="Prédictions max par minute (défaut 6)")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Modèle Replicate du mode adapt (défaut {DEFAULT_MODEL})")
@@ -1383,15 +1821,49 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--force", action="store_true", help="Régénère un item même si le JPG existe")
     parser.add_argument(
         "--mode",
-        choices=("auto", "adapt", "fix"),
+        choices=("auto", "adapt", "fix", "qa"),
         default="auto",
-        help="auto détecte une file de corrections (instruction + current)",
+        help="auto détecte une file de corrections (instruction + current). qa juge des images déjà adaptées.",
     )
-    parser.add_argument("--max-attempts", type=int, default=3, help="Essais max par image en mode fix")
+    parser.add_argument("--max-attempts", type=int, default=3, help="Essais max par image en mode fix (boucle QA)")
     parser.add_argument(
         "--only",
         default="",
         help="Sous-ensemble country:src_ad,country:src_ad (mode fix)",
+    )
+    parser.add_argument(
+        "--indices",
+        default="",
+        help="Sous-ensemble d'index de la file : 0-4 (inclus), 0:5 (fin exclue), 1,4,8. "
+        "Plusieurs workers prennent des plages différentes.",
+    )
+    parser.add_argument(
+        "--qa-folder",
+        type=Path,
+        default=None,
+        help="Dossier QA (sous-dossiers ou manifest.json). Mode qa uniquement.",
+    )
+    parser.add_argument(
+        "--qa-model",
+        default=qa_mod.QA_MODEL_DEFAULT,
+        help=f"Modèle vision Replicate pour le QA (défaut {qa_mod.QA_MODEL_DEFAULT})",
+    )
+    parser.add_argument(
+        "--no-qa",
+        action="store_true",
+        help="Mode fix sans boucle QA (ancien contrôle taille/flou, avec collage ciblé)",
+    )
+    parser.add_argument(
+        "--image-quality",
+        choices=("low", "medium", "high", "xhigh", "max", "auto"),
+        default=None,
+        help="Qualité gpt-image. Défaut du modèle : auto.",
+    )
+    parser.add_argument(
+        "--checklist",
+        type=Path,
+        default=None,
+        help="Checklist QA. Défaut : QA_CHECKLIST.md à la racine du dépôt.",
     )
     args = parser.parse_args(argv)
     if args.max_per_minute < 1:
@@ -1400,17 +1872,34 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--timeout doit être >= 1")
     if args.max_attempts < 1:
         parser.error("--max-attempts doit être >= 1")
-    if not args.inputs.is_dir():
-        parser.error(f"dossier d'entrées introuvable : {args.inputs}")
+    if args.mode == "qa":
+        if args.qa_folder is None and args.queue is None:
+            parser.error("mode qa : fournir --qa-folder ou --queue")
+        if args.qa_folder is not None and not args.qa_folder.is_dir():
+            parser.error(f"dossier QA introuvable : {args.qa_folder}")
+        if args.inputs is not None and not args.inputs.is_dir():
+            parser.error(f"dossier d'entrées introuvable : {args.inputs}")
+    else:
+        if args.queue is None:
+            parser.error("--queue est requis hors mode qa sur dossier")
+        if args.inputs is None or not args.inputs.is_dir():
+            parser.error(f"dossier d'entrées introuvable : {args.inputs}")
     return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.mode == "qa":
+        return run_qa_mode(args)
     queue = load_queue(args.queue)
     use_fix = args.mode == "fix" or (args.mode == "auto" and is_fix_queue(queue))
     if use_fix:
         return run_fix_queue(args, queue)
+    try:
+        queue = [queue[index] for index in qa_mod.select_indices(len(queue), args.indices)]
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     if not args.dry_run and not token_present():
         print(missing_token_message(), file=sys.stderr)
         return 1
