@@ -958,7 +958,8 @@ def apply_fix_once(
     timeout_s: int,
 ) -> tuple[Image.Image, list[str]]:
     prompt = build_fix_prompt(item, kind, attempt)
-    resolution = "2K"
+    # Les grands visuels photo passent en 4K pour limiter le flou au resize final.
+    resolution = "4K" if kind != "whiteboard" and max(current.size) >= 1600 else "2K"
     prediction_ids: list[str] = []
     if kind == "whiteboard" and current.size == (1254, 1254) and reference.size == current.size:
         box = WHITEBOARD_BOX
@@ -1204,6 +1205,12 @@ def run_fix_queue(args: argparse.Namespace, queue: list[Any]) -> int:
             "items": ordered,
         }
         write_report(report_path, payload)
+    payload = {
+        "max_per_minute": args.max_per_minute,
+        "dry_run": bool(args.dry_run),
+        "items": ordered,
+    }
+    write_report(report_path, payload)
     counts: dict[str, int] = {}
     for item in ordered:
         counts[item["status"]] = counts.get(item["status"], 0) + 1
