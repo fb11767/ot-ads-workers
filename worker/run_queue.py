@@ -367,15 +367,31 @@ def build_prompt(brief: dict[str, Any], copy_text: str, classification: str) -> 
     return "\n\n".join(parts)
 
 
-def model_input(model: str, prompt: str, image_path: Path) -> dict[str, Any]:
+def model_input(
+    model: str,
+    prompt: str,
+    image_path: Path | list[Path],
+    resolution: str = "2K",
+) -> dict[str, Any]:
+    paths = image_path if isinstance(image_path, list) else [image_path]
+    if "kontext" in model:
+        return {
+            "prompt": prompt,
+            "input_image": paths[0],
+            "output_format": "jpg",
+            "aspect_ratio": "match_input_image",
+            "prompt_upsampling": False,
+            "safety_tolerance": 2,
+        }
     payload: dict[str, Any] = {
         "prompt": prompt,
-        "image_input": [image_path],
+        "image_input": paths,
         "output_format": "jpg",
         "aspect_ratio": "match_input_image",
     }
     if model.endswith("pro"):
-        payload["resolution"] = "2K"
+        payload["resolution"] = resolution
+        payload["allow_fallback_model"] = False
     return payload
 
 
@@ -636,6 +652,569 @@ def adapt_image(
     return fitted, prediction_id
 
 
+# Boîte du tableau blanc sur les visuels 1254×1254 (phrase manuscrite seule).
+WHITEBOARD_BOX = (470, 88, 1100, 292)
+TEXT_MODEL = "google/nano-banana-pro"
+EDIT_MODEL = "google/nano-banana-pro"
+LOCAL_GOLF = {
+    "be-nl": "a Belgian golf course in Flanders or the Ardennes",
+    "pt": "a Portuguese golf course on the coast near Sintra",
+    "gr": "a Greek golf course with Mediterranean hills and dry light",
+    "no": "a Norwegian golf course with pines and a fjord in the distance",
+    "es": "a Spanish golf course in Andalusia or the foothills of the Pyrenees",
+}
+
+
+def is_fix_queue(queue: list[Any]) -> bool:
+    item = queue[0] if queue else None
+    return isinstance(item, dict) and "instruction" in item and "current" in item and "target_size" in item
+
+
+def quoted_phrases(instruction: str) -> list[str]:
+    return [part.strip() for part in re.findall(r"«\s*(.*?)\s*»", instruction)]
+
+
+def task_kind(instruction: str) -> str:
+    text = instruction.lower()
+    if text.startswith("tableau blanc"):
+        return "whiteboard"
+    if "pack 1" in text:
+        return "pack"
+    if "golf" in text:
+        return "golf"
+    if "voiture" in text:
+        return "car"
+    if "badge" in text:
+        return "badge"
+    if "bâtiment" in text or "batiment" in text or "tremblant" in text:
+        return "buildings"
+    if "cycliste" in text or "panneau" in text:
+        return "sign"
+    return "edit"
+
+
+def model_for_kind(kind: str) -> str:
+    # Le tableau blanc exige un modèle fiable sur le texte manuscrit.
+    # Les autres retouches restent une édition guidée par consigne et référence.
+    if kind == "whiteboard":
+        return TEXT_MODEL
+    return EDIT_MODEL
+
+
+def center_crop_resize(image: Image.Image, width: int, height: int) -> Image.Image:
+    """Recadrage centré au ratio cible, puis resize exact."""
+    if width < 1 or height < 1:
+        raise ValueError("target_size invalide")
+    image = image.convert("RGB")
+    src_w, src_h = image.size
+    target_ratio = width / height
+    current_ratio = src_w / src_h
+    if current_ratio > target_ratio:
+        crop_w = max(1, round(src_h * target_ratio))
+        left = max(0, (src_w - crop_w) // 2)
+        image = image.crop((left, 0, left + crop_w, src_h))
+    elif current_ratio < target_ratio:
+        crop_h = max(1, round(src_w / target_ratio))
+        top = max(0, (src_h - crop_h) // 2)
+        image = image.crop((0, top, src_w, top + crop_h))
+    if image.size != (width, height):
+        image = image.resize((width, height), Image.Resampling.LANCZOS)
+    if image.size != (width, height):
+        raise ValueError(f"taille {image.size} au lieu de {(width, height)}")
+    return image
+
+
+def sharpness_score(image: Image.Image) -> float:
+    import numpy as np
+
+    gray = np.asarray(image.convert("L"), dtype="float32")
+    if gray.shape[0] < 3 or gray.shape[1] < 3:
+        return 0.0
+    center = gray[1:-1, 1:-1]
+    lap = gray[:-2, 1:-1] + gray[2:, 1:-1] + gray[1:-1, :-2] + gray[1:-1, 2:] - 4.0 * center
+    return float(lap.var())
+
+
+def paste_feather(base: Image.Image, overlay: Image.Image, box: tuple[int, int, int, int], radius: int = 14) -> Image.Image:
+    x0, y0, x1, y1 = box
+    canvas = base.convert("RGB").copy()
+    piece = overlay.convert("RGB")
+    if piece.size != (x1 - x0, y1 - y0):
+        piece = piece.resize((x1 - x0, y1 - y0), Image.Resampling.LANCZOS)
+    mask = Image.new("L", piece.size, 0)
+    pixels = mask.load()
+    width, height = piece.size
+    for y in range(height):
+        for x in range(width):
+            edge = min(x, y, width - 1 - x, height - 1 - y)
+            if edge >= radius:
+                pixels[x, y] = 255
+            else:
+                pixels[x, y] = int(255 * edge / radius)
+    canvas.paste(piece, (x0, y0), mask)
+    return canvas
+
+
+def build_fix_prompt(item: dict[str, Any], kind: str, attempt: int) -> str:
+    instruction = str(item["instruction"]).strip()
+    phrases = quoted_phrases(instruction)
+    country = str(item["country"])
+    retry = ""
+    if attempt >= 2:
+        retry = (
+            " The previous attempt was rejected. Change only the requested detail. "
+            "Do not introduce any extra word, letter, logo, watermark or translation."
+        )
+    if attempt >= 3:
+        retry += " Make the requested text larger, sharper, and spelled exactly as given."
+    if kind == "whiteboard":
+        lines = "\n".join(f"Line {index}: {phrase}" for index, phrase in enumerate(phrases, start=1))
+        extra = ""
+        if "pack 3" in instruction.lower():
+            extra = (
+                " Also, on pack 3 only, set the title to exactly EQUILIBRIO TERRESTRE "
+                "with a thin small subtitle, and leave the cable unchanged. "
+                "Do not alter pack 1, pack 2, prices, or any other text."
+            )
+        return (
+            "Edit the first image. The second image is the Canadian reference: "
+            "copy only its handwritten marker style, slant, size and position. "
+            "Rewrite the handwritten whiteboard sentence so it reads EXACTLY, "
+            "with the same spelling, accents, punctuation and line breaks:\n"
+            f"{lines}\n"
+            "Do not add any other word, quote, translation, caption or decoration. "
+            "Keep the whiteboard frame and everything outside the handwriting unchanged. "
+            "Black marker handwriting only."
+            f"{extra}{retry}"
+        )
+    if kind == "golf":
+        place = LOCAL_GOLF.get(country, "a local golf course for this country")
+        return (
+            "Edit the first image. The second image is the Canadian reference for layout only. "
+            f"Replace only the background with {place}: a green fairway, exactly two golf carts, "
+            "and one or two golfers, composed like the golf background of the reference. "
+            "Keep the man, his face, clothes, pose, the table, the product and every text pixel-identical. "
+            "Do not add words, logos or watermarks."
+            f"{retry}"
+        )
+    if kind == "pack":
+        rendered = " / ".join(phrases) if phrases else instruction
+        return (
+            "Edit the first image. The second image shows the Canadian pack layout to follow. "
+            "Change only pack 1 so its layout matches the reference: "
+            f"{rendered}. "
+            "Keep pack 2, pack 3, the whiteboard, prices, people and every other text unchanged. "
+            "Do not add extra words."
+            f"{retry}"
+        )
+    if kind == "car":
+        return (
+            "Edit the first image. The second image shows the intact grey car to restore. "
+            "Replace the wrecked car with an intact grey car like the reference. "
+            "Only the local Greek background may change. Keep the framing. "
+            "Do not add any text, logo or watermark."
+            f"{retry}"
+        )
+    if kind == "badge":
+        return (
+            "Edit the first image. Replace only the Tremblant badge or sign with a plain blank white panel. "
+            "Change nothing else: same buildings, people, framing, colors and any other text. "
+            "The white panel must contain no letters."
+            f"{retry}"
+        )
+    if kind == "buildings":
+        return (
+            "Edit the first image. Replace the Tremblant resort buildings with hotels of South Tyrol "
+            "(Alto Adige / Haut-Adige), keeping the same framing and crop. "
+            "Do not add the word Tremblant. Do not add extra text, logos or watermarks. "
+            "Keep people and the overall composition."
+            f"{retry}"
+        )
+    if kind == "sign":
+        return (
+            "Edit the first image. In the top-right cyclists panel only, replace the Quebec lake scenery "
+            "with the Haute-Sûre or the Moselle in Luxembourg. "
+            "Keep the same cyclists, their poses, the panel framing, and every other panel unchanged. "
+            "Do not change any text."
+            f"{retry}"
+        )
+    return (
+        "Edit the first image using the second image only as a layout reference. "
+        f"Apply only this correction: {instruction}. "
+        "Keep product, people, prices and already validated text unchanged. Do not add stray text."
+        f"{retry}"
+    )
+
+
+def edit_with_references(
+    images: list[Image.Image],
+    prompt: str,
+    model: str,
+    limiter: RateLimiter,
+    timeout_s: int,
+    resolution: str = "2K",
+) -> tuple[Image.Image, str]:
+    """Édite la première image ; les suivantes sont des références. Retour aux pixels de la première."""
+    import replicate
+
+    if not images:
+        raise ValueError("aucune image à éditer")
+    padded_primary, meta = pad_to_supported(images[0])
+    client = replicate.Client()
+    with tempfile.TemporaryDirectory(prefix="ot-fix-") as tmp:
+        paths: list[Path] = []
+        root = Path(tmp)
+        right = meta.pad_w - meta.width - meta.pad_x
+        bottom = meta.pad_h - meta.height - meta.pad_y
+        for index, image in enumerate(images):
+            source = image.convert("RGB")
+            if source.size != (meta.width, meta.height):
+                source = center_crop_resize(source, meta.width, meta.height)
+            padded = reflect_pad(source, meta.pad_x, meta.pad_y, right, bottom)
+            path = root / f"in_{index}.jpg"
+            save_jpg(padded, path, quality=95)
+            paths.append(path)
+        raw_path = root / "raw.jpg"
+        prediction = run_prediction(
+            client,
+            model,
+            model_input(model, prompt, paths, resolution=resolution),
+            limiter,
+            timeout_s,
+        )
+        prediction_id = str(prediction.id)
+        if prediction.status != "succeeded":
+            detail = prediction.error or prediction.status
+            raise WorkerError(f"{prediction_id}: {detail}", prediction_id)
+        raw_path.write_bytes(download_output(output_url(prediction.output)))
+        fitted = fit_cover(open_rgb(raw_path), meta)
+    return fitted, prediction_id
+
+
+def resolve_fix_path(relative: str, inputs: Path) -> Path:
+    path = safe_join(inputs, relative.replace("\\", "/"))
+    if not path.is_file():
+        raise ValueError(f"fichier introuvable : {relative}")
+    return path
+
+
+def parse_target_size(value: Any) -> tuple[int, int]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError("target_size doit être [largeur, hauteur]")
+    width, height = int(value[0]), int(value[1])
+    if width < 1 or height < 1:
+        raise ValueError("target_size invalide")
+    return width, height
+
+
+def load_report_index(path: Path) -> dict[tuple[str, str], dict[str, Any]]:
+    if not path.is_file():
+        return {}
+    data = load_json(path)
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return {}
+    index: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in items:
+        if isinstance(item, dict) and item.get("country") and item.get("src_ad"):
+            index[(str(item["country"]), str(item["src_ad"]))] = item
+    return index
+
+
+def fix_report_entry(
+    country: str,
+    src_ad: str,
+    status: str,
+    model: str,
+    attempts: int,
+    remark: str,
+    out: str | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    prediction_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "country": country,
+        "src_ad": src_ad,
+        "status": status,
+        "model": model,
+        "attempts": attempts,
+        "remark": remark,
+        "out": out,
+        "width": width,
+        "height": height,
+        "prediction_ids": prediction_ids or [],
+    }
+
+
+def apply_fix_once(
+    current: Image.Image,
+    reference: Image.Image,
+    item: dict[str, Any],
+    kind: str,
+    model: str,
+    attempt: int,
+    limiter: RateLimiter,
+    timeout_s: int,
+) -> tuple[Image.Image, list[str]]:
+    prompt = build_fix_prompt(item, kind, attempt)
+    resolution = "2K"
+    prediction_ids: list[str] = []
+    if kind == "whiteboard" and current.size == (1254, 1254) and reference.size == current.size:
+        box = WHITEBOARD_BOX
+        crop = current.crop(box)
+        ref_crop = reference.crop(box)
+        edited, prediction_id = edit_with_references(
+            [crop, ref_crop], prompt, model, limiter, timeout_s, resolution=resolution
+        )
+        prediction_ids.append(prediction_id)
+        merged = paste_feather(current, edited, box)
+        if "pack 3" in str(item["instruction"]).lower():
+            # Deuxième passe ciblée : le pack 3 est le volet de droite.
+            width, height = current.size
+            pack_box = (width * 2 // 3, int(height * 0.42), width, int(height * 0.92))
+            pack_prompt = (
+                "Edit the first image, which is pack 3 of the ad. "
+                "Set the product title to exactly EQUILIBRIO TERRESTRE in the same place as the reference title, "
+                "with one thin small subtitle under it. Leave the cable unchanged. "
+                "Do not add any other words. Keep the product photo, colors and framing."
+            )
+            pack_edit, pack_id = edit_with_references(
+                [merged.crop(pack_box), reference.crop(pack_box)],
+                pack_prompt,
+                model,
+                limiter,
+                timeout_s,
+                resolution=resolution,
+            )
+            prediction_ids.append(pack_id)
+            merged = paste_feather(merged, pack_edit, pack_box, radius=10)
+        return merged, prediction_ids
+    edited, prediction_id = edit_with_references(
+        [current, reference], prompt, model, limiter, timeout_s, resolution=resolution
+    )
+    prediction_ids.append(prediction_id)
+    return edited, prediction_ids
+
+
+def assess_fix(
+    image: Image.Image,
+    original: Image.Image,
+    target: tuple[int, int],
+    kind: str,
+    ignore_boxes: list[tuple[int, int, int, int]] | None = None,
+) -> str | None:
+    if image.size != target:
+        return f"taille {image.size[0]}x{image.size[1]} au lieu de {target[0]}x{target[1]}"
+    reference = original
+    if original.size != image.size:
+        reference = center_crop_resize(original, image.size[0], image.size[1])
+    score = sharpness_score(image)
+    base = sharpness_score(reference)
+    if base > 1 and score < base * 0.22:
+        return f"image trop floue (netteté {score:.0f} contre {base:.0f})"
+    if kind == "whiteboard" and image.size == original.size:
+        import numpy as np
+
+        before = np.asarray(original.convert("RGB"), dtype="int16")
+        after = np.asarray(image.convert("RGB"), dtype="int16")
+        if before.shape != after.shape:
+            return "dimensions internes incohérentes"
+        delta = np.abs(before - after).max(axis=2)
+        mask = delta > 18
+        for box in ignore_boxes or [WHITEBOARD_BOX]:
+            x0, y0, x1, y1 = box
+            mask[y0:y1, x0:x1] = False
+        changed = int(mask.sum())
+        if changed > 2500:
+            return f"zones hors retouche modifiées ({changed} px)"
+    return None
+
+
+def process_fix_item(
+    item: Any,
+    inputs: Path,
+    artifacts: Path,
+    limiter: RateLimiter | None,
+    timeout_s: int,
+    dry_run: bool,
+    force: bool,
+    max_attempts: int,
+    previous: dict[str, Any] | None,
+) -> dict[str, Any]:
+    country = ""
+    src_ad = ""
+    try:
+        if not isinstance(item, dict):
+            raise ValueError("item de file invalide")
+        country = str(item.get("country", "")).strip()
+        src_ad = str(item.get("src_ad", "")).strip()
+        if not COUNTRY_RE.match(country):
+            raise ValueError(f"country invalide : {country}")
+        if not SRC_AD_RE.match(src_ad) or ".." in src_ad:
+            raise ValueError(f"src_ad invalide : {src_ad}")
+        instruction = str(item.get("instruction", "")).strip()
+        if not instruction:
+            raise ValueError("instruction vide")
+        kind = task_kind(instruction)
+        model = model_for_kind(kind)
+        target = parse_target_size(item.get("target_size"))
+        destination = output_path(artifacts, country, src_ad)
+        out_label = destination.as_posix()
+        prior_attempts = int(previous.get("attempts") or 0) if previous else 0
+        if destination.is_file() and destination.stat().st_size > 0 and not force and not dry_run:
+            existing = open_rgb(destination)
+            if existing.size == target and previous and previous.get("status") == "ok":
+                print(f"[skipped] {country} {src_ad}", flush=True)
+                kept = dict(previous)
+                kept["out"] = out_label
+                return kept
+        if dry_run:
+            current_path = resolve_fix_path(str(item["current"]), inputs)
+            resolve_fix_path(str(item["ca_source"]), inputs)
+            current = open_rgb(current_path)
+            print(
+                f"[dry_run] {country} {src_ad} {kind} {model} {current.size} -> {target[0]}x{target[1]}",
+                flush=True,
+            )
+            return fix_report_entry(
+                country,
+                src_ad,
+                "ok",
+                model,
+                0,
+                f"dry-run {kind}",
+                out_label,
+                target[0],
+                target[1],
+            )
+        assert limiter is not None
+        current = open_rgb(resolve_fix_path(str(item["current"]), inputs))
+        reference = open_rgb(resolve_fix_path(str(item["ca_source"]), inputs))
+        start_attempt = prior_attempts + 1 if force else 1
+        last_remark = "échec"
+        last_final: Image.Image | None = None
+        prediction_ids: list[str] = []
+        used_attempts = prior_attempts
+        for attempt in range(start_attempt, max_attempts + 1):
+            used_attempts = attempt
+            edited, ids = apply_fix_once(
+                current, reference, item, kind, model, attempt, limiter, timeout_s
+            )
+            prediction_ids.extend(ids)
+            final = center_crop_resize(edited, target[0], target[1])
+            last_final = final
+            ignore = [WHITEBOARD_BOX]
+            if "pack 3" in instruction.lower() and current.size == (1254, 1254):
+                width, height = current.size
+                ignore.append((width * 2 // 3, int(height * 0.42), width, int(height * 0.92)))
+            problem = assess_fix(final, current, target, kind, ignore)
+            if problem:
+                last_remark = problem
+                print(f"[retry] {country} {src_ad} essai {attempt} : {problem}", flush=True)
+                continue
+            save_jpg(final, destination, quality=JPG_QUALITY)
+            remark = f"{kind}, essai {attempt}"
+            print(f"[ok] {country} {src_ad} {model} essai {attempt} -> {out_label}", flush=True)
+            return fix_report_entry(
+                country,
+                src_ad,
+                "ok",
+                model,
+                attempt,
+                remark,
+                out_label,
+                final.size[0],
+                final.size[1],
+                prediction_ids,
+            )
+        print(f"[échec] {country} {src_ad} : {last_remark}", file=sys.stderr, flush=True)
+        if last_final is not None:
+            save_jpg(last_final, destination, quality=JPG_QUALITY)
+        return fix_report_entry(
+            country,
+            src_ad,
+            "échec",
+            model,
+            used_attempts,
+            last_remark,
+            out_label if destination.is_file() else None,
+            last_final.size[0] if last_final is not None else None,
+            last_final.size[1] if last_final is not None else None,
+            prediction_ids,
+        )
+    except Exception as exc:
+        message = redact(str(exc) or exc.__class__.__name__)
+        label = f"{country} {src_ad}".strip() or "?"
+        print(f"[échec] {label} : {message}", file=sys.stderr, flush=True)
+        model = EDIT_MODEL
+        attempts = int(previous.get("attempts") or 0) if previous else 0
+        return fix_report_entry(country, src_ad, "échec", model, attempts, message)
+
+
+def parse_only(raw: str) -> set[tuple[str, str]] | None:
+    text = raw.strip()
+    if not text:
+        return None
+    selected: set[tuple[str, str]] = set()
+    for part in text.split(","):
+        if ":" not in part:
+            raise SystemExit(f"--only invalide : {part}")
+        country, src_ad = part.split(":", 1)
+        selected.add((country.strip(), src_ad.strip()))
+    return selected
+
+
+def run_fix_queue(args: argparse.Namespace, queue: list[Any]) -> int:
+    if not args.dry_run and not token_present():
+        print(missing_token_message(), file=sys.stderr)
+        return 1
+    selected = parse_only(args.only)
+    report_path = args.artifacts / "report.json"
+    previous = load_report_index(report_path)
+    limiter = None if args.dry_run else RateLimiter(args.max_per_minute)
+    ordered: list[dict[str, Any]] = []
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in queue:
+        if not isinstance(item, dict):
+            entry = fix_report_entry("", "", "échec", args.model, 0, "item de file invalide")
+            ordered.append(entry)
+            continue
+        key = (str(item.get("country", "")).strip(), str(item.get("src_ad", "")).strip())
+        if selected is not None and key not in selected:
+            if key in previous:
+                ordered.append(previous[key])
+            continue
+        entry = process_fix_item(
+            item,
+            args.inputs,
+            args.artifacts,
+            limiter,
+            args.timeout,
+            args.dry_run,
+            args.force,
+            args.max_attempts,
+            previous.get(key),
+        )
+        ordered.append(entry)
+        by_key[key] = entry
+        payload = {
+            "max_per_minute": args.max_per_minute,
+            "dry_run": bool(args.dry_run),
+            "items": ordered,
+        }
+        write_report(report_path, payload)
+    counts: dict[str, int] = {}
+    for item in ordered:
+        counts[item["status"]] = counts.get(item["status"], 0) + 1
+    summary = ", ".join(f"{count} {status}" for status, count in sorted(counts.items()))
+    print(f"{len(ordered)} item(s): {summary}", flush=True)
+    print(f"rapport: {report_path.as_posix()}", flush=True)
+    if any(item["status"] == "échec" for item in ordered):
+        return 1
+    return 0
+
+
 def process_item(
     item: Any,
     inputs: Path,
@@ -734,11 +1313,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=900, help="Attente max d'une prédiction, en secondes")
     parser.add_argument("--dry-run", action="store_true", help="Valide la file et les chemins, sans Replicate")
     parser.add_argument("--force", action="store_true", help="Régénère un item même si le JPG existe")
+    parser.add_argument(
+        "--mode",
+        choices=("auto", "adapt", "fix"),
+        default="auto",
+        help="auto détecte une file de corrections (instruction + current)",
+    )
+    parser.add_argument("--max-attempts", type=int, default=3, help="Essais max par image en mode fix")
+    parser.add_argument(
+        "--only",
+        default="",
+        help="Sous-ensemble country:src_ad,country:src_ad (mode fix)",
+    )
     args = parser.parse_args(argv)
     if args.max_per_minute < 1:
         parser.error("--max-per-minute doit être >= 1")
     if args.timeout < 1:
         parser.error("--timeout doit être >= 1")
+    if args.max_attempts < 1:
+        parser.error("--max-attempts doit être >= 1")
     if not args.inputs.is_dir():
         parser.error(f"dossier d'entrées introuvable : {args.inputs}")
     return args
@@ -746,10 +1339,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    queue = load_queue(args.queue)
+    use_fix = args.mode == "fix" or (args.mode == "auto" and is_fix_queue(queue))
+    if use_fix:
+        return run_fix_queue(args, queue)
     if not args.dry_run and not token_present():
         print(missing_token_message(), file=sys.stderr)
         return 1
-    queue = load_queue(args.queue)
     limiter = None if args.dry_run else RateLimiter(args.max_per_minute)
     report_path = args.artifacts / "report.json"
     items: list[dict[str, Any]] = []
