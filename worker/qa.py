@@ -560,8 +560,8 @@ def prediction_metrics(prediction: Any) -> dict[str, Any]:
 
     return {
         "predict_time": pick("predict_time", "total_time"),
-        "input_tokens": pick("input_token_count", "input_tokens"),
-        "output_tokens": pick("output_token_count", "output_tokens"),
+        "input_tokens": pick("token_input_count", "input_token_count", "input_tokens"),
+        "output_tokens": pick("token_output_count", "output_token_count", "output_tokens"),
     }
 
 

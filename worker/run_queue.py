@@ -898,6 +898,7 @@ def edit_with_references(
     fit: str = "cover",
     target: tuple[int, int] | None = None,
     quality: str | None = None,
+    metrics_sink: list[dict[str, Any]] | None = None,
 ) -> tuple[Image.Image, str]:
     """Édite la première image ; les suivantes sont des références.
 
@@ -937,6 +938,8 @@ def edit_with_references(
             if prediction.status != "succeeded":
                 detail = prediction.error or prediction.status
                 raise WorkerError(f"{prediction_id}: {detail}", prediction_id)
+            if metrics_sink is not None:
+                metrics_sink.append(qa_mod.prediction_metrics(prediction))
             raw_path.write_bytes(download_output(output_url(prediction.output)))
             raw = open_rgb(raw_path)
             if fit == "resize":
@@ -1074,6 +1077,7 @@ def process_fix_item_qa(
     best: dict[str, Any] | None = None
     prediction_ids: list[str] = []
     qa_metrics: list[dict[str, Any]] = []
+    gen_metrics: list[dict[str, Any]] = []
     generated = 0
     started = time.perf_counter()
     used_attempts = 0
@@ -1093,6 +1097,7 @@ def process_fix_item_qa(
                 fit="resize",
                 target=target,
                 quality=image_quality,
+                metrics_sink=gen_metrics,
             )
         except Exception as exc:
             message = redact(str(exc) or exc.__class__.__name__)
@@ -1161,6 +1166,7 @@ def process_fix_item_qa(
     entry["seconds"] = round(elapsed, 3)
     entry["generated_images"] = generated
     entry["qa_metrics"] = qa_metrics
+    entry["gen_metrics"] = gen_metrics
     entry["qa_model"] = qa_model
     print(f"[{verdict}] {country} {src_ad} -> {out_label}", flush=True)
     return entry
@@ -1486,10 +1492,14 @@ def write_batch_summary(
 ) -> Path:
     qa_metrics: list[dict[str, Any]] = []
     generated = 0
+    gen_seconds = 0.0
     items: list[dict[str, Any]] = []
     for entry in ordered:
         qa_metrics.extend(entry.get("qa_metrics") or [])
         generated += int(entry.get("generated_images") or 0)
+        for metrics in entry.get("gen_metrics") or []:
+            if metrics.get("predict_time") is not None:
+                gen_seconds += float(metrics["predict_time"])
         items.append(
             {
                 "country": entry.get("country"),
@@ -1497,6 +1507,7 @@ def write_batch_summary(
                 "verdict": entry.get("verdict"),
                 "status": entry.get("status"),
                 "attempts": entry.get("attempts"),
+                "attempts_run": entry.get("attempts_this_run"),
                 "seconds": entry.get("seconds"),
                 "image": entry.get("out"),
                 "report": entry.get("report"),
@@ -1518,6 +1529,7 @@ def write_batch_summary(
             image_quality=image_quality or "auto",
         ),
     }
+    payload["cost"]["gen_predict_seconds"] = round(gen_seconds, 3)
     path = summary_path(artifacts, indices)
     write_report(path, payload)
     print(f"batch: {passed} PASS, {failed} FAIL, {len(ordered)} total", flush=True)
